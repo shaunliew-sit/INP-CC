@@ -65,7 +65,6 @@ Download the preprocess image features from [link](https://disk.pku.edu.cn/link/
  |─ INP-CC
  │   |- swig_image_embeddings.pkl
  │   |- hico_image_embeddings.pkl
-
  :       :
 ```
 
