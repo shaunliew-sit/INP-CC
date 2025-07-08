@@ -57,6 +57,19 @@ SWIG-DET dataset can be downloaded [here](https://swig-data-weights.s3.us-east-2
  :       :
 ```
 
+### Pre-processed Features
+
+Download the preprocess image features from [link](https://disk.pku.edu.cn/link/AA55FCFC5B31CE4F649AF62BD15E6498C2). The downloaded files have to be placed as follows.
+
+``` plain
+ |─ INP-CC
+ │   |- swig_image_embeddings.pkl
+ │   |- hico_image_embeddings.pkl
+
+ :       :
+```
+
+
 ## Training
 
 Run this command to train the model in HICO-DET dataset
