@@ -68,6 +68,15 @@ Download the preprocess image features from [link](https://disk.pku.edu.cn/link/
  :       :
 ```
 
+Download the preprocess features from [link](https://disk.pku.edu.cn/link/AA4EC02DC76B0141F19716726FBB253751). The downloaded files have to be placed as follows.
+
+``` plain
+ |─ INP-CC
+ │   └─ InstructEmbed/1108/
+ │       |- swig_embeddings_1108.pkl
+ │       |- hico_embeddings_1108.pkl
+ :       :
+```
 
 ## Training
 
