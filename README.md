@@ -1,5 +1,6 @@
 # INP-CC
 
+[[Project Page]](https://sites.google.com/view/inp-cc/%E9%A6%96%E9%A1%B5) [[Arxiv]](https://arxiv.org/pdf/2508.03207)
 
 This repository contains the official PyTorch implementation for the paper: 
 
