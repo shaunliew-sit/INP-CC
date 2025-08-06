@@ -1,4 +1,4 @@
-# CMD-SE
+# INP-CC
 
 
 This repository contains the official PyTorch implementation for the paper: 
