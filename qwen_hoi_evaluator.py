@@ -13,13 +13,17 @@ import torch.nn.functional as F
 import numpy as np
 import argparse
 from typing import Dict, List, Tuple, Any, Union
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 import time
 from datetime import datetime
 import logging
 from pathlib import Path
 import gc
 from scipy.optimize import linear_sum_assignment
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+from matplotlib.colors import ListedColormap
+import cv2
 
 # Add current directory to path for imports
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -120,12 +124,27 @@ class DatasetSpecificHandler:
         self.hoi_annotation_key = "hoi_annotations" 
         self.box_annotation_key = "box_annotations"
     
-    def get_interaction_text(self, hoi_index: int) -> str:
-        """Get text description for HOI index"""
-        if hoi_index < len(self.dataset_texts):
-            action, obj = self.dataset_texts[hoi_index]
-            return f"{action} {obj}"
-        return "unknown interaction"
+    def get_interaction_text(self, hoi_id: int) -> str:
+        """Get text description for HOI ID"""
+        if self.dataset_type == "hico":
+            # HICO: Use the hoi_id_to_text_id mapping to get the correct interaction
+            if hoi_id in self.hoi_id_to_text_id:
+                text_index = self.hoi_id_to_text_id[hoi_id]
+                if text_index < len(self.dataset_texts):
+                    action, obj = self.dataset_texts[text_index]
+                    return f"{action} {obj}"
+        else:  # SWIG
+            # SWIG: Find interaction by ID in SWIG_INTERACTIONS
+            for interaction in self.interactions:
+                if interaction["id"] == hoi_id:
+                    action_id = interaction["action_id"]
+                    object_id = interaction["object_id"]
+                    
+                    action_name = self.actions[action_id]["name"]
+                    object_name = self.categories[object_id]["name"]
+                    return f"{action_name} {object_name}"
+        
+        return f"unknown interaction (ID: {hoi_id})"
     
     def get_all_interaction_texts(self) -> List[str]:
         """Get all interaction texts for prompt engineering"""
@@ -652,6 +671,483 @@ class EnhancedDatasetLoader:
             annotations.append(ann)
         
         return images, annotations
+
+
+class HOIVisualizationEngine:
+    """
+    Comprehensive visualization engine for HOI detection results.
+    Shows predictions, ground truth, bounding boxes, and action labels with dataset-specific formatting.
+    """
+    
+    def __init__(self, dataset_handler: DatasetSpecificHandler, output_dir: str):
+        self.dataset_handler = dataset_handler
+        self.output_dir = Path(output_dir)
+        self.viz_dir = self.output_dir / "visualizations"
+        self.viz_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Color schemes for different elements
+        self.colors = {
+            'human_pred': (255, 0, 0),      # Red for predicted human
+            'object_pred': (0, 255, 0),     # Green for predicted object  
+            'human_gt': (255, 165, 0),      # Orange for GT human
+            'object_gt': (0, 0, 255),       # Blue for GT object
+            'interaction_line': (255, 255, 0)  # Yellow for interaction lines
+        }
+        
+        # Font settings - more robust font loading
+        self.font_size = 20
+        self.font = self._load_font()
+        
+        self.logger = logging.getLogger(__name__)
+    
+    def _load_font(self):
+        """Robustly load font with multiple fallback options"""
+        font_paths = [
+            # Common system font paths
+            "/System/Library/Fonts/Arial.ttf",
+            "/System/Library/Fonts/Helvetica.ttc", 
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+            "/Windows/Fonts/arial.ttf",
+            "arial.ttf",
+            "DejaVuSans.ttf"
+        ]
+        
+        for font_path in font_paths:
+            try:
+                return ImageFont.truetype(font_path, self.font_size)
+            except (OSError, IOError):
+                continue
+        
+        # Final fallback - use default font
+        try:
+            return ImageFont.load_default()
+        except:
+            # Create a minimal default font if everything fails
+            self.logger.warning("Using minimal default font")
+            return None
+    
+    def _get_title_font(self):
+        """Get larger font for titles"""
+        try:
+            if self.font is not None:
+                # Try to create larger version of current font
+                return ImageFont.truetype(self.font.path, 24) if hasattr(self.font, 'path') else self.font
+            else:
+                return None
+        except:
+            return self.font
+    
+    def _safe_text_draw(self, draw, position, text, fill='black', font=None):
+        """Safely draw text handling font issues"""
+        try:
+            if font is None:
+                font = self.font
+            draw.text(position, text, fill=fill, font=font)
+        except Exception as e:
+            # Fallback to drawing without font
+            try:
+                draw.text(position, text, fill=fill)
+            except Exception as e2:
+                self.logger.warning(f"Text drawing failed: {e2}")
+    
+    def _safe_textbbox(self, draw, position, text, font=None):
+        """Safely get text bounding box"""
+        try:
+            if font is None:
+                font = self.font
+            if hasattr(draw, 'textbbox'):
+                return draw.textbbox(position, text, font=font)
+            else:
+                # Fallback for older PIL versions
+                return draw.textsize(text, font=font)
+        except:
+            # Return approximate bbox
+            return (position[0], position[1], position[0] + len(text) * 8, position[1] + 20)
+        
+    def visualize_hoi_detection(self, image: Image.Image, predictions: Dict, ground_truth: Dict, 
+                               image_id: int, save_individual: bool = True) -> Image.Image:
+        """
+        Create comprehensive HOI detection visualization with predictions and ground truth.
+        
+        Args:
+            image: PIL Image
+            predictions: Qwen2.5VL predictions 
+            ground_truth: Ground truth annotations
+            image_id: Image identifier
+            save_individual: Whether to save individual visualization
+            
+        Returns:
+            PIL Image with visualizations
+        """
+        # Create side-by-side comparison: Predictions | Ground Truth
+        img_width, img_height = image.size
+        comparison_width = img_width * 2 + 60  # Space for divider
+        comparison_height = img_height + 100   # Space for title and legends
+        
+        # Create comparison canvas
+        comparison_img = Image.new('RGB', (comparison_width, comparison_height), color='white')
+        
+        # Draw predictions on left side
+        pred_img = self._draw_predictions(image.copy(), predictions, image_id)
+        comparison_img.paste(pred_img, (0, 50))
+        
+        # Draw ground truth on right side  
+        gt_img = self._draw_ground_truth(image.copy(), ground_truth, image_id)
+        comparison_img.paste(gt_img, (img_width + 60, 50))
+        
+        # Add titles and legends
+        self._add_titles_and_legends(comparison_img, img_width)
+        
+        # Add divider line
+        draw = ImageDraw.Draw(comparison_img)
+        divider_x = img_width + 30
+        draw.line([(divider_x, 0), (divider_x, comparison_height)], fill='black', width=2)
+        
+        if save_individual:
+            save_path = self.viz_dir / f"hoi_detection_comparison_{image_id}.png"
+            comparison_img.save(save_path)
+            self.logger.info(f"Saved HOI visualization: {save_path}")
+        
+        return comparison_img
+    
+    def _draw_predictions(self, image: Image.Image, predictions: Dict, image_id: int) -> Image.Image:
+        """Draw predicted HOI detections on image."""
+        draw = ImageDraw.Draw(image)
+        interactions = predictions.get('interactions', [])
+        
+        if not interactions:
+            # Add "No Predictions" text
+            self._safe_text_draw(draw, (10, 10), "No Predictions", fill='red')
+            return image
+        
+        for i, interaction in enumerate(interactions):
+            # Get bounding boxes
+            human_bbox = interaction.get('human_bbox', [0, 0, 1, 1])
+            object_bbox = interaction.get('object_bbox', [0, 0, 1, 1])
+            confidence = interaction.get('confidence', 0.0)
+            hoi_id = interaction.get('hoi_id', 0)
+            interaction_name = interaction.get('interaction_name', 'unknown')
+            
+            # Draw human bounding box (red)
+            self._draw_bbox(draw, human_bbox, self.colors['human_pred'], 
+                           f"Human {i+1}", thickness=3)
+            
+            # Draw object bounding box (green)
+            self._draw_bbox(draw, object_bbox, self.colors['object_pred'], 
+                           f"Object {i+1}", thickness=3)
+            
+            # Draw interaction line connecting human and object centers
+            h_center = ((human_bbox[0] + human_bbox[2]) // 2, (human_bbox[1] + human_bbox[3]) // 2)
+            o_center = ((object_bbox[0] + object_bbox[2]) // 2, (object_bbox[1] + object_bbox[3]) // 2)
+            draw.line([h_center, o_center], fill=self.colors['interaction_line'], width=2)
+            
+            # Add interaction label with confidence
+            label_pos = (min(h_center[0], o_center[0]), min(h_center[1], o_center[1]) - 25)
+            action_text = f"{interaction_name} ({confidence:.2f})"
+            
+            # Add text background for better readability
+            bbox = self._safe_textbbox(draw, label_pos, action_text)
+            draw.rectangle(bbox, fill='white', outline='black')
+            self._safe_text_draw(draw, label_pos, action_text, fill='black')
+        
+        return image
+    
+    def _draw_ground_truth(self, image: Image.Image, ground_truth: Dict, image_id: int) -> Image.Image:
+        """Draw ground truth HOI annotations on image."""
+        draw = ImageDraw.Draw(image)
+        annotation = ground_truth.get('annotation', {})
+        
+        # Get annotations based on dataset type
+        if self.dataset_handler.dataset_type == "hico":
+            hoi_annotations = annotation.get('hoi_annotation', [])
+            box_annotations = annotation.get('annotations', [])
+        else:  # swig
+            hoi_annotations = annotation.get('hoi_annotations', [])
+            box_annotations = annotation.get('box_annotations', [])
+        
+        if not hoi_annotations:
+            # Add "No Ground Truth" text
+            self._safe_text_draw(draw, (10, 10), "No Ground Truth", fill='blue')
+            return image
+        
+        for i, hoi in enumerate(hoi_annotations):
+            subject_id = hoi.get('subject_id', 0)
+            object_id = hoi.get('object_id', 0)
+            
+            # Get HOI ID correctly based on dataset format
+            if self.dataset_handler.dataset_type == "hico":
+                # HICO format: need to map category_id + object_id to HOI ID
+                # Following the same logic as HICOEvaluator
+                action_id = hoi.get("category_id", 1) - 1  # Convert from 1-based to 0-based
+                if object_id < len(box_annotations):
+                    object_category_id = box_annotations[object_id].get("category_id", 1)
+                    
+                    # Map to action and object names
+                    action_name = None
+                    object_name = None
+                    
+                    # Find action name
+                    from datasets.hico_categories import HICO_ACTIONS, HICO_OBJECTS
+                    for action in HICO_ACTIONS:
+                        if action["id"] == action_id:
+                            action_name = action["name"]
+                            break
+                    
+                    # Find object name  
+                    for obj in HICO_OBJECTS:
+                        if obj["id"] == object_category_id:
+                            object_name = obj["name"]
+                            break
+                    
+                    # Find HOI ID from action-object pair
+                    hoi_id = None
+                    if action_name and object_name:
+                        for interaction in self.dataset_handler.interactions:
+                            if interaction["action"] == action_name and interaction["object"] == object_name:
+                                hoi_id = interaction["interaction_id"]
+                                break
+                    
+                    if hoi_id is None:
+                        hoi_id = hoi.get('hoi_id', 0)  # Fallback
+                else:
+                    hoi_id = hoi.get('hoi_id', 0)  # Fallback
+                    
+            else:  # SWIG
+                # SWIG format: map action_id + object_id to HOI ID (same logic as SWIG evaluator)
+                action_id = hoi.get('action_id', 0)
+                if object_id < len(box_annotations):
+                    object_category_id = box_annotations[object_id].get("category_id", 0)
+                    
+                    # Use the action_object_to_hoi mapping created in dataset handler
+                    hoi_id = self.dataset_handler.action_object_to_hoi.get((action_id, object_category_id), 0)
+                else:
+                    hoi_id = 0
+            
+            # Get interaction name
+            interaction_name = self.dataset_handler.get_interaction_text(hoi_id)
+            
+            # Get bounding boxes
+            if subject_id < len(box_annotations) and object_id < len(box_annotations):
+                human_box = box_annotations[subject_id].get('bbox', [0, 0, 1, 1])
+                object_box = box_annotations[object_id].get('bbox', [0, 0, 1, 1])
+                
+                # Convert from xywh to xyxy if needed
+                if len(human_box) == 4:
+                    if human_box[2] < human_box[0]:  # Likely xywh format
+                        human_bbox = [human_box[0], human_box[1], 
+                                    human_box[0] + human_box[2], human_box[1] + human_box[3]]
+                        object_bbox = [object_box[0], object_box[1],
+                                     object_box[0] + object_box[2], object_box[1] + object_box[3]]
+                    else:  # Already xyxy format
+                        human_bbox = human_box
+                        object_bbox = object_box
+                    
+                    # Draw human bounding box (orange)
+                    self._draw_bbox(draw, human_bbox, self.colors['human_gt'], 
+                                   f"GT Human {i+1}", thickness=3)
+                    
+                    # Draw object bounding box (blue)
+                    self._draw_bbox(draw, object_bbox, self.colors['object_gt'], 
+                                   f"GT Object {i+1}", thickness=3)
+                    
+                    # Draw interaction line
+                    h_center = ((human_bbox[0] + human_bbox[2]) // 2, (human_bbox[1] + human_bbox[3]) // 2)
+                    o_center = ((object_bbox[0] + object_bbox[2]) // 2, (object_bbox[1] + object_bbox[3]) // 2)
+                    draw.line([h_center, o_center], fill=self.colors['interaction_line'], width=2)
+                    
+                    # Add interaction label
+                    label_pos = (min(h_center[0], o_center[0]), min(h_center[1], o_center[1]) - 25)
+                    action_text = f"GT: {interaction_name}"
+                    
+                    # Add text background
+                    bbox = self._safe_textbbox(draw, label_pos, action_text)
+                    draw.rectangle(bbox, fill='white', outline='black')
+                    self._safe_text_draw(draw, label_pos, action_text, fill='black')
+        
+        return image
+    
+    def _draw_bbox(self, draw: ImageDraw.Draw, bbox: List[int], color: Tuple[int, int, int], 
+                   label: str, thickness: int = 2):
+        """Draw bounding box with label."""
+        x1, y1, x2, y2 = bbox
+        
+        # Draw bounding box
+        for i in range(thickness):
+            draw.rectangle([x1-i, y1-i, x2+i, y2+i], outline=color, width=1)
+        
+        # Draw label background and text
+        label_bbox = self._safe_textbbox(draw, (x1, y1-25), label)
+        draw.rectangle(label_bbox, fill=color, outline='black')
+        self._safe_text_draw(draw, (x1, y1-25), label, fill='white')
+    
+    def _add_titles_and_legends(self, image: Image.Image, img_width: int):
+        """Add titles and color legends to comparison image."""
+        draw = ImageDraw.Draw(image)
+        
+        # Add titles
+        title_font = self._get_title_font()
+        draw.text((img_width//2 - 100, 10), "Predictions", fill='black', font=title_font)
+        draw.text((img_width + 60 + img_width//2 - 100, 10), "Ground Truth", fill='black', font=title_font)
+        
+        # Add legends at the bottom
+        legend_y = image.height - 40
+        
+        # Predictions legend
+        pred_legend_items = [
+            ("Red: Predicted Human", self.colors['human_pred']),
+            ("Green: Predicted Object", self.colors['object_pred'])
+        ]
+        
+        x_offset = 10
+        for text, color in pred_legend_items:
+            draw.rectangle([x_offset, legend_y, x_offset + 15, legend_y + 15], fill=color)
+            self._safe_text_draw(draw, (x_offset + 20, legend_y), text, fill='black')
+            x_offset += 250
+        
+        # Ground truth legend
+        gt_legend_items = [
+            ("Orange: GT Human", self.colors['human_gt']),
+            ("Blue: GT Object", self.colors['object_gt'])
+        ]
+        
+        x_offset = img_width + 70
+        for text, color in gt_legend_items:
+            draw.rectangle([x_offset, legend_y, x_offset + 15, legend_y + 15], fill=color)
+            self._safe_text_draw(draw, (x_offset + 20, legend_y), text, fill='black')
+            x_offset += 200
+    
+    def create_detection_summary(self, all_results: List[Dict], save_path: str = None) -> str:
+        """Create a text summary of all detection results."""
+        summary_lines = [
+            "=" * 80,
+            "HOI DETECTION RESULTS SUMMARY",
+            "=" * 80,
+            f"Dataset: {self.dataset_handler.dataset_type.upper()}",
+            f"Total Images Processed: {len(all_results)}",
+            ""
+        ]
+        
+        total_predictions = 0
+        total_gt_annotations = 0
+        
+        for result in all_results:
+            image_id = result.get('image_id', 'unknown')
+            predictions = result.get('predictions', {})
+            ground_truth = result.get('ground_truth', {})
+            
+            pred_interactions = predictions.get('interactions', [])
+            num_predictions = len(pred_interactions)
+            total_predictions += num_predictions
+            
+            # Count GT annotations
+            annotation = ground_truth.get('annotation', {})
+            if self.dataset_handler.dataset_type == "hico":
+                gt_interactions = annotation.get('hoi_annotation', [])
+            else:
+                gt_interactions = annotation.get('hoi_annotations', [])
+            
+            num_gt = len(gt_interactions)
+            total_gt_annotations += num_gt
+            
+            summary_lines.extend([
+                f"Image {image_id}:",
+                f"  Predictions: {num_predictions}",
+                f"  Ground Truth: {num_gt}"
+            ])
+            
+            # List predicted interactions
+            if pred_interactions:
+                summary_lines.append("  Predicted Interactions:")
+                for i, interaction in enumerate(pred_interactions):
+                    interaction_name = interaction.get('interaction_name', 'unknown')
+                    confidence = interaction.get('confidence', 0.0)
+                    summary_lines.append(f"    {i+1}. {interaction_name} (conf: {confidence:.3f})")
+            else:
+                summary_lines.append("  No predictions made")
+            
+            # List GT interactions
+            if gt_interactions:
+                summary_lines.append("  Ground Truth Interactions:")
+                for i, hoi in enumerate(gt_interactions):
+                    # Get HOI ID correctly based on dataset format (same logic as visualization)
+                    if self.dataset_handler.dataset_type == "hico":
+                        # HICO format processing
+                        action_id = hoi.get("category_id", 1) - 1
+                        
+                        # Get box annotations for this image
+                        box_annotations = annotation.get('annotations', [])
+                        object_idx = hoi.get('object_id', 0)
+                        
+                        if object_idx < len(box_annotations):
+                            object_category_id = box_annotations[object_idx].get("category_id", 1)
+                            
+                            # Find action and object names
+                            from datasets.hico_categories import HICO_ACTIONS, HICO_OBJECTS
+                            action_name = None
+                            object_name = None
+                            
+                            for action in HICO_ACTIONS:
+                                if action["id"] == action_id:
+                                    action_name = action["name"]
+                                    break
+                            
+                            for obj in HICO_OBJECTS:
+                                if obj["id"] == object_category_id:
+                                    object_name = obj["name"]
+                                    break
+                            
+                            # Find HOI ID
+                            hoi_id = None
+                            if action_name and object_name:
+                                for interaction in self.dataset_handler.interactions:
+                                    if interaction["action"] == action_name and interaction["object"] == object_name:
+                                        hoi_id = interaction["interaction_id"]
+                                        break
+                        
+                        if hoi_id is None:
+                            hoi_id = hoi.get('hoi_id', 0)
+                            
+                    else:  # SWIG
+                        # SWIG format: map action_id + object_id to HOI ID
+                        action_id = hoi.get('action_id', 0)
+                        object_idx = hoi.get('object_id', 0)
+                        
+                        box_annotations = annotation.get('box_annotations', [])
+                        if object_idx < len(box_annotations):
+                            object_category_id = box_annotations[object_idx].get("category_id", 0)
+                            hoi_id = self.dataset_handler.action_object_to_hoi.get((action_id, object_category_id), 0)
+                        else:
+                            hoi_id = 0
+                    
+                    interaction_name = self.dataset_handler.get_interaction_text(hoi_id)
+                    summary_lines.append(f"    {i+1}. {interaction_name}")
+            else:
+                summary_lines.append("  No ground truth annotations")
+                
+            summary_lines.append("")
+        
+        summary_lines.extend([
+            "=" * 80,
+            "OVERALL STATISTICS",
+            "=" * 80,
+            f"Total Predictions Made: {total_predictions}",
+            f"Total Ground Truth Annotations: {total_gt_annotations}",
+            f"Average Predictions per Image: {total_predictions/len(all_results):.2f}",
+            f"Average GT Annotations per Image: {total_gt_annotations/len(all_results):.2f}",
+            "=" * 80
+        ])
+        
+        summary_text = "\n".join(summary_lines)
+        
+        if save_path is None:
+            save_path = self.viz_dir / "detection_summary.txt"
+        
+        with open(save_path, 'w') as f:
+            f.write(summary_text)
+        
+        self.logger.info(f"Detection summary saved to: {save_path}")
+        return summary_text
 
 
 class QwenHOILossComputer:
@@ -1250,6 +1746,14 @@ def main():
     parser.add_argument('--save_predictions', action='store_true',
                        help="Save raw predictions for analysis")
     
+    # Visualization arguments
+    parser.add_argument('--enable_visualization', action='store_true', default=True,
+                       help="Enable HOI detection visualizations")
+    parser.add_argument('--viz_max_images', type=int, default=None,
+                       help="Maximum number of images to visualize (None = all)")
+    parser.add_argument('--viz_confidence_threshold', type=float, default=0.0,
+                       help="Minimum confidence threshold for visualization")
+    
     args = parser.parse_args()
     
     # Create output directory
@@ -1282,6 +1786,17 @@ def main():
     # Initialize loss computer for INP-CC-compatible loss computation
     loss_computer = QwenHOILossComputer(detector.dataset_handler, detector.device)
     logger.info("Loss computation framework initialized")
+    
+    # Initialize visualization engine if enabled
+    visualizer = None
+    all_viz_results = []
+    
+    if args.enable_visualization:
+        visualizer = HOIVisualizationEngine(detector.dataset_handler, args.output_dir)
+        logger.info("Visualization engine initialized")
+        logger.info(f"Visualization settings: max_images={args.viz_max_images}, conf_threshold={args.viz_confidence_threshold}")
+    else:
+        logger.info("Visualization disabled")
     
     # Initialize evaluator (following INP-CC approach)
     if args.dataset_file == "hico":
@@ -1327,6 +1842,46 @@ def main():
                 predictions = postprocessor.apply_nms(predictions)
                 
                 all_predictions[image_id] = predictions
+                
+                # Create visualizations for this image (if enabled)
+                if visualizer is not None:
+                    # Check visualization limits
+                    should_visualize = True
+                    
+                    if args.viz_max_images is not None and len(all_viz_results) >= args.viz_max_images:
+                        should_visualize = False
+                    
+                    # Check confidence threshold for predictions
+                    if should_visualize and args.viz_confidence_threshold > 0:
+                        interactions = result.get('interactions', [])
+                        if interactions:
+                            max_conf = max(interaction.get('confidence', 0.0) for interaction in interactions)
+                            if max_conf < args.viz_confidence_threshold:
+                                should_visualize = False
+                    
+                    if should_visualize:
+                        try:
+                            viz_image = visualizer.visualize_hoi_detection(
+                                image=img,
+                                predictions=result,  # Use raw Qwen results for visualization
+                                ground_truth=ann,
+                                image_id=image_id,
+                                save_individual=True
+                            )
+                            
+                            # Store results for summary
+                            all_viz_results.append({
+                                'image_id': image_id,
+                                'predictions': result,
+                                'ground_truth': ann,
+                                'processed_predictions': predictions
+                            })
+                            
+                            logger.info(f"Created visualization for image {image_id}")
+                            
+                        except Exception as e:
+                            logger.warning(f"Failed to create visualization for image {image_id}: {e}")
+                            # Continue with evaluation even if visualization fails
             
             # Update evaluator (following INP-CC evaluation pipeline)
             evaluator.update(all_predictions)
@@ -1474,9 +2029,28 @@ def main():
         evaluator.save_preds()
         logger.info(f"Predictions saved to {args.output_dir}")
     
+    # Generate visualization summary
+    if all_viz_results:
+        try:
+            logger.info("Generating visualization summary...")
+            summary_text = visualizer.create_detection_summary(all_viz_results)
+            logger.info(f"Visualization summary created with {len(all_viz_results)} images")
+            
+            # Print a snippet of the summary to console
+            logger.info("=== Detection Summary Preview ===")
+            summary_lines = summary_text.split('\n')
+            for line in summary_lines[:15]:  # Show first 15 lines
+                logger.info(line)
+            logger.info(f"... (see full summary in {visualizer.viz_dir}/detection_summary.txt)")
+            
+        except Exception as e:
+            logger.warning(f"Failed to create visualization summary: {e}")
+    
     logger.info("Evaluation completed successfully!")
     logger.info(f"Results saved to: {results_file}")
     logger.info(f"Loss statistics saved to: {loss_file}")
+    if visualizer is not None:
+        logger.info(f"Visualizations saved to: {visualizer.viz_dir}")
     
     return combined_results
 
