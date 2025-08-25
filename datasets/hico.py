@@ -66,7 +66,7 @@ class HICO(CocoDetection):
             repeat_factor_sampling=repeat_factor_sampling,
             ignore_non_interaction=ignore_non_interaction,
             zero_shot_interaction_ids=hico_unseen_index[zero_shot_type])
-        self.filename2embedding = pickle.load(open("hico_image_embeddings.pkl", "rb"))
+        self.filename2embedding = pickle.load(open("checkpoints/image_embeddings/hico_image_embeddings.pkl", "rb"))
 
     def __getitem__(self, idx: int):
 

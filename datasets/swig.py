@@ -31,7 +31,7 @@ class SWiGHOIDetection(CocoDetection):
         repeat_factor_sampling = repeat_factor_sampling and image_set == "train"
         reverse_text_mapper = {v: k for k, v in text_mapper.items()}
         self.dataset_dicts = load_swig_json(ann_file, img_folder, reverse_text_mapper, repeat_factor_sampling)
-        self.filename2embedding = pickle.load(open("swig_image_embeddings.pkl", "rb"))
+        self.filename2embedding = pickle.load(open("checkpoints/image_embeddings/swig_image_embeddings.pkl", "rb"))
 
     def __getitem__(self, idx: int):
 

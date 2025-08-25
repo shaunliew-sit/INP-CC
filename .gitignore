@@ -1,0 +1,5 @@
+.DS_Store
+inp-cc-env
+data/*
+checkpoints/*
+venv/*

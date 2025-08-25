@@ -664,14 +664,8 @@ class QwenHOILossComputer:
         self.dataset_handler = dataset_handler
         self.device = device if device else torch.device('cpu')
         
-        # Loss tracking
-        self.loss_stats = {
-            'loss_ce': [],
-            'loss_bbox': [],
-            'loss_giou': [],
-            'loss_conf': [],
-            'total_loss': []
-        }
+        # Loss tracking (initialize empty to allow dynamic keys)
+        self.loss_stats = {}
         
         # Matching parameters (same as INP-CC)
         self.cost_class = 1.0
@@ -760,8 +754,9 @@ class QwenHOILossComputer:
         
         # Update running statistics
         for key, value in avg_losses.items():
-            if key in self.loss_stats:
-                self.loss_stats[key].append(value)
+            if key not in self.loss_stats:
+                self.loss_stats[key] = []
+            self.loss_stats[key].append(value)
         
         return avg_losses
     
@@ -1368,17 +1363,32 @@ def main():
         seen_mAP = np.mean(evaluator.hico_ap[seen_hois])
         full_mAP = np.mean(evaluator.hico_ap[valid_hois])
         
+        # HICO-specific metrics (uses zero_shot and seen terminology)
         metrics = {
             "zero_shot_mAP": float(zero_shot_mAP),
             "seen_mAP": float(seen_mAP), 
-            "full_mAP": float(full_mAP),
-            "rare_mAP": float(zero_shot_mAP),  # For compatibility
+            "full_mAP": float(full_mAP)
         }
     else:  # SWIG
-        # For SWIG-HOI, need similar logic
-        evaluator.summarize()
+        # Extract mAP values for SWIG-HOI dataset
+        from datasets.swig_v1_categories import SWIG_INTERACTIONS
+        
+        eval_hois = np.asarray([x["id"] for x in SWIG_INTERACTIONS if x["evaluation"] == 1])
+        zero_hois = np.asarray([x["id"] for x in SWIG_INTERACTIONS if x["frequency"] == 0 and x["evaluation"] == 1])
+        rare_hois = np.asarray([x["id"] for x in SWIG_INTERACTIONS if x["frequency"] == 1 and x["evaluation"] == 1])
+        nonrare_hois = np.asarray([x["id"] for x in SWIG_INTERACTIONS if x["frequency"] == 2 and x["evaluation"] == 1])
+        
+        full_mAP = np.mean(evaluator.swig_ap[eval_hois])
+        zero_shot_mAP = np.mean(evaluator.swig_ap[zero_hois])
+        rare_mAP = np.mean(evaluator.swig_ap[rare_hois])
+        nonrare_mAP = np.mean(evaluator.swig_ap[nonrare_hois])
+        
+        # SWIG-specific metrics (uses zero_shot, rare, nonrare terminology)  
         metrics = {
-            "mAP": 0.0  # Placeholder - would need SWIG-specific implementation
+            "zero_shot_mAP": float(zero_shot_mAP),
+            "rare_mAP": float(rare_mAP),
+            "nonrare_mAP": float(nonrare_mAP),
+            "full_mAP": float(full_mAP)
         }
     
     # Also call the original summarize for console output
@@ -1387,13 +1397,56 @@ def main():
     # Get final loss statistics
     loss_stats = loss_computer.get_final_loss_statistics()
     logger.info("Loss Statistics (INP-CC compatible):")
-    for key, value in loss_stats.items():
-        logger.info(f"  {key}: {value:.4f}")
+    
+    # Log scaled losses first
+    logger.info("Scaled losses:")
+    for key in ['loss_ce', 'loss_bbox', 'loss_giou', 'loss_conf', 'total_loss']:
+        if key in loss_stats:
+            logger.info(f"  {key}: {loss_stats[key]:.4f}")
+    
+    # Log unscaled losses
+    logger.info("Unscaled losses:")
+    for key in ['loss_ce_unscaled', 'loss_bbox_unscaled', 'loss_giou_unscaled', 'loss_conf_unscaled']:
+        if key in loss_stats:
+            logger.info(f"  {key}: {loss_stats[key]:.4f}")
+        else:
+            logger.info(f"  {key}: 0.0000 (missing)")
+    
+    # Log scaling factors used
+    logger.info("Scaling factors applied:")
+    logger.info(f"  loss_ce_scale: {loss_computer.weight_dict['loss_ce']}")
+    logger.info(f"  loss_bbox_scale: {loss_computer.weight_dict['loss_bbox']}")
+    logger.info(f"  loss_giou_scale: {loss_computer.weight_dict['loss_giou']}")
+    logger.info(f"  loss_conf_scale: {loss_computer.weight_dict['loss_conf']}")
+    
+    # Prepare enhanced loss metrics with both scaled and unscaled values + scaling info
+    enhanced_loss_metrics = {
+        # Scaled losses (main losses)
+        "loss_ce": loss_stats.get("loss_ce", 0.0),
+        "loss_bbox": loss_stats.get("loss_bbox", 0.0), 
+        "loss_giou": loss_stats.get("loss_giou", 0.0),
+        "loss_conf": loss_stats.get("loss_conf", 0.0),
+        "total_loss": loss_stats.get("total_loss", 0.0),
+        
+        # Unscaled losses (INP-CC compatible)
+        "loss_ce_unscaled": loss_stats.get("loss_ce_unscaled", 0.0),
+        "loss_bbox_unscaled": loss_stats.get("loss_bbox_unscaled", 0.0),
+        "loss_giou_unscaled": loss_stats.get("loss_giou_unscaled", 0.0), 
+        "loss_conf_unscaled": loss_stats.get("loss_conf_unscaled", 0.0),
+        
+        # Scaling factors for transparency
+        "scaling_factors": {
+            "loss_ce_scale": loss_computer.weight_dict['loss_ce'],
+            "loss_bbox_scale": loss_computer.weight_dict['loss_bbox'],
+            "loss_giou_scale": loss_computer.weight_dict['loss_giou'],
+            "loss_conf_scale": loss_computer.weight_dict['loss_conf']
+        }
+    }
     
     # Combine evaluation and loss metrics in required format
     combined_results = {
         "evaluation_metrics": metrics,
-        "loss_metrics": loss_stats
+        "loss_metrics": enhanced_loss_metrics
     }
     
     # Save combined results
