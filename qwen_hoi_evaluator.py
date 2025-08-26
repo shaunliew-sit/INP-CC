@@ -23,7 +23,7 @@ from scipy.optimize import linear_sum_assignment
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 from matplotlib.colors import ListedColormap
-import cv2
+# import cv2  # Optional dependency for advanced image processing
 
 # Add current directory to path for imports
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -61,7 +61,7 @@ class DatasetSpecificHandler:
             raise ValueError(f"Unsupported dataset: {self.dataset_type}")
     
     def _setup_hico(self):
-        """Setup HICO-DET specific configurations"""
+        """Setup HICO-DET specific configurations following INP-CC format"""
         # HICO interactions format: action_object pattern
         self.interactions = HICO_INTERACTIONS
         self.actions = HICO_ACTIONS
@@ -70,40 +70,54 @@ class DatasetSpecificHandler:
         # HICO uses 600 interaction categories (0-599)
         self.num_interactions = 600
         
-        # Text format: [action_name, object_name]
+        # Create action-object to HOI ID mapping following INP-CC approach (datasets/hico.py line 153)
+        self.action_object_to_hoi_id = {(x["action"], x["object"]): x["interaction_id"] for x in HICO_INTERACTIONS}
+        
+        # Text format: [action_name, object_name] following INP-CC dataset preparation
         self.dataset_texts = []
         self.text_mapper = {}
         
         for i, hoi in enumerate(HICO_INTERACTIONS):
-            action_name = " ".join(hoi["action"].split("_"))  # Convert underscore to space
+            # Use exact action and object names as in INP-CC
+            action_name = hoi["action"]  # Keep underscores as they are in HICO_INTERACTIONS
             object_name = hoi["object"]
             text_pair = [action_name, object_name]
             self.dataset_texts.append(text_pair)
-            self.text_mapper[len(self.dataset_texts)-1] = i
+            # Map to the actual HOI ID, not index
+            self.text_mapper[i] = hoi["interaction_id"]
         
         # Create reverse mapping for evaluation
         self.hoi_id_to_text_id = {hoi["interaction_id"]: i for i, hoi in enumerate(HICO_INTERACTIONS)}
+        
+        # Create action and object name to ID mappings (following INP-CC evaluator logic)
+        self.action_name_to_id = {x["name"]: x["id"] for x in HICO_ACTIONS}
+        self.object_name_to_id = {x["name"]: x["id"] for x in HICO_OBJECTS}
         
         # Annotation structure: 'hoi_annotation' key
         self.hoi_annotation_key = "hoi_annotation"
         self.box_annotation_key = "annotations"
         
     def _setup_swig(self):
-        """Setup SWIG-HOI specific configurations"""
+        """Setup SWIG-HOI specific configurations following INP-CC format"""
         # SWIG interactions with evaluation flags
         self.interactions = SWIG_INTERACTIONS
         self.actions = SWIG_ACTIONS
         self.categories = SWIG_CATEGORIES
         
-        # Only consider interactions marked for evaluation
+        # Only consider interactions marked for evaluation (following INP-CC approach)
         self.eval_interactions = [x for x in SWIG_INTERACTIONS if x.get("evaluation", 0) == 1]
-        self.num_interactions = len(self.eval_interactions)
+        eval_hoi_ids = [x["id"] for x in SWIG_INTERACTIONS if x["evaluation"] == 1]
+        self.num_interactions = max(eval_hoi_ids) + 1  # Following SWiGEvaluator line 13
         
-        # Text format: [action_name, object_name]
+        # Create action_id-object_id to HOI ID mapping following INP-CC approach (datasets/swig.py line 137)
+        self.action_object_to_hoi = {(x["action_id"], x["object_id"]): x["id"] for x in SWIG_INTERACTIONS}
+        
+        # Text format: [action_name, object_name] following INP-CC dataset preparation
         self.dataset_texts = []
         self.text_mapper = {}
         
-        for i, hoi in enumerate(SWIG_INTERACTIONS):
+        text_idx = 0
+        for hoi in SWIG_INTERACTIONS:
             if hoi.get("evaluation", 0) == 0:
                 continue  # Skip non-evaluation interactions
             
@@ -115,10 +129,9 @@ class DatasetSpecificHandler:
             text_pair = [action_name, object_name]
             
             self.dataset_texts.append(text_pair)
-            self.text_mapper[len(self.dataset_texts)-1] = i
-        
-        # Create mapping from (action_id, object_id) to HOI ID
-        self.action_object_to_hoi = {(x["action_id"], x["object_id"]): x["id"] for x in SWIG_INTERACTIONS}
+            # Map to the actual HOI ID, not index
+            self.text_mapper[text_idx] = hoi["id"]
+            text_idx += 1
         
         # Annotation structure: 'hoi_annotations' key (plural)
         self.hoi_annotation_key = "hoi_annotations" 
@@ -151,28 +164,58 @@ class DatasetSpecificHandler:
         return [f"{pair[0]} {pair[1]}" for pair in self.dataset_texts]
     
     def map_hoi_name_to_id(self, interaction_name: str) -> Union[int, None]:
-        """Map interaction name to dataset-specific HOI ID"""
+        """Map interaction name to dataset-specific HOI ID using exact matching only (following INP-CC)"""
         interaction_name = interaction_name.strip().lower()
         
-        # Try exact matching first
-        for i, (action, obj) in enumerate(self.dataset_texts):
-            full_name = f"{action} {obj}".lower()
-            if full_name == interaction_name:
-                return self.text_mapper.get(i, i)
+        if self.dataset_type == "hico":
+            # HICO: Use exact action-object matching following INP-CC approach
+            # Try with space between action and object (most common format from LLM)
+            for action_name, object_name in self.dataset_texts:
+                # Convert underscores to spaces for display/LLM format matching
+                display_action = " ".join(action_name.split("_")).lower()
+                display_object = object_name.lower()
+                full_name = f"{display_action} {display_object}"
+                
+                if full_name == interaction_name:
+                    # Use the action-object mapping to get correct HOI ID
+                    return self.action_object_to_hoi_id.get((action_name, object_name))
+                    
+            # Try without space (concatenated format)
+            for action_name, object_name in self.dataset_texts:
+                display_action = " ".join(action_name.split("_")).lower()
+                display_object = object_name.lower()
+                full_name = f"{display_action}{display_object}"  # No space
+                
+                if full_name.replace(" ", "") == interaction_name.replace(" ", ""):
+                    return self.action_object_to_hoi_id.get((action_name, object_name))
+                    
+        else:  # SWIG
+            # SWIG: Use exact action-object matching following INP-CC approach
+            for action_name, object_name in self.dataset_texts:
+                full_name = f"{action_name.lower()} {object_name.lower()}"
+                
+                if full_name == interaction_name:
+                    # Find the corresponding action_id and object_id
+                    action_id = None
+                    object_id = None
+                    
+                    for action in self.actions:
+                        if action["name"].lower() == action_name.lower():
+                            action_id = action["id"]
+                            break
+                    
+                    for category in self.categories:
+                        if category["name"].lower() == object_name.lower():
+                            object_id = category["id"]
+                            break
+                    
+                    if action_id is not None and object_id is not None:
+                        return self.action_object_to_hoi.get((action_id, object_id))
         
-        # Try fuzzy matching
-        from difflib import SequenceMatcher
-        best_score = 0.0
-        best_id = None
-        
-        for i, (action, obj) in enumerate(self.dataset_texts):
-            full_name = f"{action} {obj}".lower()
-            score = SequenceMatcher(None, interaction_name, full_name).ratio()
-            if score > best_score and score > 0.7:
-                best_score = score
-                best_id = self.text_mapper.get(i, i)
-        
-        return best_id
+        # No exact match found - log warning and return None
+        if hasattr(self, 'logger'):
+            self.logger.warning(f"No exact match found for interaction: '{interaction_name}'")
+        return None
 
 
 class EnhancedQwenHOIPromptEngine:
@@ -1613,7 +1656,7 @@ class EnhancedPostProcessor:
         self.nms_threshold = nms_threshold
     
     def __call__(self, qwen_output: Dict, image_id: int) -> List[List]:
-        """Convert Qwen output to evaluation format following INP-CC postprocessors"""
+        """Convert Qwen output to evaluation format following INP-CC postprocessors exactly"""
         results = []
         
         for interaction in qwen_output.get('interactions', []):
@@ -1627,9 +1670,18 @@ class EnhancedPostProcessor:
             human_bbox = interaction.get('human_bbox', [])
             object_bbox = interaction.get('object_bbox', [])
             
-            if hoi_id is not None and len(human_bbox) == 4 and len(object_bbox) == 4:
-                # Format following INP-CC PostProcess: [hoi_id, score, h_x1, h_y1, h_x2, h_y2, o_x1, o_y1, o_x2, o_y2]
-                result = [hoi_id, confidence] + human_bbox + object_bbox
+            # Validate all required components are present
+            if (hoi_id is not None and 
+                len(human_bbox) == 4 and len(object_bbox) == 4 and
+                all(isinstance(coord, (int, float)) for coord in human_bbox + object_bbox)):
+                
+                # Ensure integer coordinates as expected by evaluators
+                human_bbox = [float(coord) for coord in human_bbox]
+                object_bbox = [float(coord) for coord in object_bbox]
+                
+                # Format exactly as expected by HICOEvaluator/SWiGEvaluator:
+                # [hoi_id, score, h_x1, h_y1, h_x2, h_y2, o_x1, o_y1, o_x2, o_y2]
+                result = [int(hoi_id), float(confidence)] + human_bbox + object_bbox
                 results.append(result)
         
         return results
@@ -1783,9 +1835,9 @@ def main():
     dataloader = detector.create_dataset_loader(args.data_root, args.annotation_file, args.max_images)
     postprocessor = EnhancedPostProcessor(detector.dataset_handler, args.score_threshold, args.nms_threshold)
     
-    # Initialize loss computer for INP-CC-compatible loss computation
+    # Initialize loss computer for INP-CC-compatible loss computation during inference
     loss_computer = QwenHOILossComputer(detector.dataset_handler, detector.device)
-    logger.info("Loss computation framework initialized")
+    logger.info("Loss computation framework initialized for INP-CC consistency")
     
     # Initialize visualization engine if enabled
     visualizer = None
@@ -1825,13 +1877,26 @@ def main():
             images, annotations = dataloader.get_batch(batch_indices)
             
             # Run detection
-            logger.info(f"Processing batch {i//args.batch_size + 1}/{(total_images-1)//args.batch_size + 1}")
+            batch_num = i//args.batch_size + 1
+            total_batches = (total_images-1)//args.batch_size + 1
+            logger.info(f"Processing batch {batch_num}/{total_batches}")
             batch_results = detector.detect_hoi_batch(images, args.batch_size)
             
-            # Compute losses for this batch
+            # Compute losses for this batch (INP-CC consistency)
             image_sizes = [(img.width, img.height) for img in images]
             batch_losses = loss_computer.compute_losses(batch_results, annotations, image_sizes)
-            logger.debug(f"Batch losses: {batch_losses}")
+            
+            # Log batch progress with loss metrics (matching INP-CC format)
+            loss_ce = batch_losses.get('loss_ce', 0.0)
+            loss_bbox = batch_losses.get('loss_bbox', 0.0) 
+            loss_giou = batch_losses.get('loss_giou', 0.0)
+            loss_conf = batch_losses.get('loss_conf', 0.0)
+            total_loss = batch_losses.get('total_loss', 0.0)
+            
+            logger.info(f"Qwen Test: [{batch_num}/{total_batches}] "
+                       f"loss: {total_loss:.4f} loss_ce: {loss_ce:.4f} "
+                       f"loss_bbox: {loss_bbox:.4f} loss_giou: {loss_giou:.4f} "
+                       f"loss_conf: {loss_conf:.4f}")
             
             # Process results (following INP-CC evaluation format)
             for img, ann, result in zip(images, annotations, batch_results):
@@ -1949,17 +2014,17 @@ def main():
     # Also call the original summarize for console output
     evaluator.summarize()
     
-    # Get final loss statistics
+    # Get final loss statistics (INP-CC consistency)
     loss_stats = loss_computer.get_final_loss_statistics()
     logger.info("Loss Statistics (INP-CC compatible):")
     
-    # Log scaled losses first
+    # Log scaled losses first (matching INP-CC format)
     logger.info("Scaled losses:")
     for key in ['loss_ce', 'loss_bbox', 'loss_giou', 'loss_conf', 'total_loss']:
         if key in loss_stats:
             logger.info(f"  {key}: {loss_stats[key]:.4f}")
     
-    # Log unscaled losses
+    # Log unscaled losses (INP-CC compatibility)
     logger.info("Unscaled losses:")
     for key in ['loss_ce_unscaled', 'loss_bbox_unscaled', 'loss_giou_unscaled', 'loss_conf_unscaled']:
         if key in loss_stats:
@@ -1967,16 +2032,9 @@ def main():
         else:
             logger.info(f"  {key}: 0.0000 (missing)")
     
-    # Log scaling factors used
-    logger.info("Scaling factors applied:")
-    logger.info(f"  loss_ce_scale: {loss_computer.weight_dict['loss_ce']}")
-    logger.info(f"  loss_bbox_scale: {loss_computer.weight_dict['loss_bbox']}")
-    logger.info(f"  loss_giou_scale: {loss_computer.weight_dict['loss_giou']}")
-    logger.info(f"  loss_conf_scale: {loss_computer.weight_dict['loss_conf']}")
-    
-    # Prepare enhanced loss metrics with both scaled and unscaled values + scaling info
+    # Prepare enhanced results with both evaluation and loss metrics (INP-CC consistency)
     enhanced_loss_metrics = {
-        # Scaled losses (main losses)
+        # Scaled losses (main losses matching INP-CC)
         "loss_ce": loss_stats.get("loss_ce", 0.0),
         "loss_bbox": loss_stats.get("loss_bbox", 0.0), 
         "loss_giou": loss_stats.get("loss_giou", 0.0),
@@ -1989,7 +2047,7 @@ def main():
         "loss_giou_unscaled": loss_stats.get("loss_giou_unscaled", 0.0), 
         "loss_conf_unscaled": loss_stats.get("loss_conf_unscaled", 0.0),
         
-        # Scaling factors for transparency
+        # Scaling factors for transparency (matching INP-CC)
         "scaling_factors": {
             "loss_ce_scale": loss_computer.weight_dict['loss_ce'],
             "loss_bbox_scale": loss_computer.weight_dict['loss_bbox'],
@@ -1998,10 +2056,14 @@ def main():
         }
     }
     
-    # Combine evaluation and loss metrics in required format
+    # Combine evaluation and loss metrics (INP-CC format consistency)
     combined_results = {
         "evaluation_metrics": metrics,
-        "loss_metrics": enhanced_loss_metrics
+        "loss_metrics": enhanced_loss_metrics,
+        "dataset": args.dataset_file,
+        "model": args.model_name,
+        "score_threshold": args.score_threshold,
+        "nms_threshold": args.nms_threshold
     }
     
     # Save combined results
@@ -2020,7 +2082,7 @@ def main():
     with open(perf_file, 'w') as f:
         json.dump(perf_stats, f, indent=2)
     
-    # Save loss statistics separately for analysis
+    # Save loss statistics separately for analysis (INP-CC consistency)
     loss_file = output_dir / "loss_statistics.json"
     with open(loss_file, 'w') as f:
         json.dump(loss_stats, f, indent=2)
@@ -2048,6 +2110,7 @@ def main():
     
     logger.info("Evaluation completed successfully!")
     logger.info(f"Results saved to: {results_file}")
+    logger.info(f"Performance statistics saved to: {perf_file}")
     logger.info(f"Loss statistics saved to: {loss_file}")
     if visualizer is not None:
         logger.info(f"Visualizations saved to: {visualizer.viz_dir}")
