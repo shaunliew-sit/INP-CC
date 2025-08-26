@@ -153,6 +153,16 @@ def get_args_parser():
     parser.add_argument('--eval_size', default=448, type=int, help="image resolution for evaluation")
     parser.add_argument('--vis_outputs', action='store_true', help='visualize the model outputs')
     parser.add_argument('--vis_dir', default='', help='path where to save visualization results')
+    
+    # Enhanced visualization arguments
+    parser.add_argument('--enhanced_vis', action='store_true', 
+                        help='enable enhanced visualization with comprehensive analysis')
+    parser.add_argument('--vis_max_images', default=50, type=int,
+                        help='maximum number of images to visualize')
+    parser.add_argument('--vis_threshold', default=0.1, type=float,
+                        help='confidence threshold for visualization')
+    parser.add_argument('--vis_max_detections', default=10, type=int,
+                        help='maximum number of detections per image to visualize')
     parser.add_argument('--bbox_lambda', default=2.0, type=float)
     parser.add_argument('--aux_text_weight', default=1.0, type=float)
     parser.add_argument('--best_beta', default=1.0, type=float)

@@ -13,6 +13,7 @@ import utils.misc as utils
 from models.model import convert_weights
 from datasets import build_evaluator
 from utils.visualizer import Visualizer
+from utils.enhanced_visualizer import INPCCVisualizationEngine
 # from fvcore.nn import FlopCountAnalysis, flop_count_table
 from clip.simple_tokenizer import SimpleTokenizer as _Tokenizer
 _tokenizer = _Tokenizer()
@@ -104,6 +105,18 @@ def evaluate(model, postprocessors, criterion, data_loader, device, args):
     evaluator = build_evaluator(args)
     hoi_descriptions = get_hoi_calibrated_embedding(args.instruction_embedding_file)
     # hoi_descriptions = get_hoi_descriptions(dataset_name=args.dataset_file, description_file_path=args.description_file_path)
+    
+    # Initialize enhanced visualization engine
+    enhanced_visualizer = None
+    if args.enhanced_vis:
+        enhanced_vis_dir = os.path.join(args.output_dir, "enhanced_visualization")
+        enhanced_visualizer = INPCCVisualizationEngine(
+            output_dir=enhanced_vis_dir,
+            dataset_handler=data_loader.dataset,
+            max_images=getattr(args, 'vis_max_images', 50)
+        )
+        print(f"🎨 Enhanced visualization enabled: {enhanced_vis_dir}")
+    
     # Convert all interaction categories into embeddings, only forward pass once!!
     text_tokens, auxiliary_texts = prepare_text_inputs(model, data_loader.dataset.dataset_texts, device, hoi_descriptions)
     text_features = model.encode_text(text_tokens, pure_words=False)
@@ -218,6 +231,18 @@ def evaluate(model, postprocessors, criterion, data_loader, device, args):
             # visualizer.visualize_preds(images, targets, outputs, vis_threshold=0.2, HOI_CATEGORIES=HOI_CATEGORIES)
             pred_info = visualizer.visualize_attention(images, targets, outputs, vis_threshold=0.2, HOI_CATEGORIES=HOI_CATEGORIES)
             all_pred_info.extend(pred_info)
+        
+        # Enhanced visualization with comprehensive analysis
+        if enhanced_visualizer is not None:
+            image_ids = [int(t['image_id']) for t in targets]
+            enhanced_visualizer.visualize_predictions(
+                images=images,
+                targets=targets,
+                outputs=outputs,
+                image_ids=image_ids,
+                vis_threshold=getattr(args, 'vis_threshold', 0.1),
+                max_detections=getattr(args, 'vis_max_detections', 10)
+            )
 
         # reduce losses over all GPUs for logging purposes
         loss_dict_reduced = utils.reduce_dict(loss_dict)
@@ -241,6 +266,10 @@ def evaluate(model, postprocessors, criterion, data_loader, device, args):
         pickle.dump(all_pred_info, f)
         
 
+    # Generate enhanced visualization summary
+    if enhanced_visualizer is not None:
+        enhanced_visualizer.generate_summary()
+    
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)

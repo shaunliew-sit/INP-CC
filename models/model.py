@@ -1080,7 +1080,7 @@ def build_model(args):
         model.load_state_dict(state_dict, strict=False)
 
     if args.pretrained:
-        checkpoint = torch.load(args.pretrained, map_location='cpu')
+        checkpoint = torch.load(args.pretrained, map_location='cpu', weights_only=False)
         model.load_state_dict(checkpoint["model"], strict=True)
 
     # Build matcher and criterion
